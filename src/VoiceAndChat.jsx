@@ -45,7 +45,7 @@ export default function VoiceAndChat({ socket, roomData, videoRef }) {
     if (!ctxRef.current && Ctx) {
       const c = new Ctx();
       const g = c.createGain();
-      g.gain.value = voiceRef.current;
+      g.gain.value = Math.max(0, voiceRef.current - 1);
       g.connect(c.destination);
       ctxRef.current = c;
       gainRef.current = g;
@@ -201,7 +201,9 @@ export default function VoiceAndChat({ socket, roomData, videoRef }) {
       return flash("Microphone needs a secure (https) connection.");
     }
     try {
-      localRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localRef.current = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
       setMuted(false);
       setJoined(true);
     } catch {
@@ -232,7 +234,7 @@ export default function VoiceAndChat({ socket, roomData, videoRef }) {
     const v = Number(e.target.value);
     setVoice(v);
     voiceRef.current = v;
-    if (gainRef.current) gainRef.current.gain.value = v;
+    if (gainRef.current) gainRef.current.gain.value = Math.max(0, v - 1);
   };
 
   const sendChat = (e) => {
@@ -271,7 +273,8 @@ export default function VoiceAndChat({ socket, roomData, videoRef }) {
           ref={(el) => {
             if (!el) return;
             if (el.srcObject !== r.stream) el.srcObject = r.stream;
-            el.muted = !!gainRef.current;
+            el.muted = false;
+            el.volume = Math.min(voiceRef.current, 1);
           }}
         />
       ))}
@@ -368,7 +371,9 @@ export default function VoiceAndChat({ socket, roomData, videoRef }) {
             />
           </label>
           <p className="text-[11px] text-zinc-400">
-            {joined ? "Voice connected. Use headphones to avoid echo." : "Tap Join Voice to talk with friends."}
+            {joined
+              ? "Voice connected. Use earphones to avoid echo, and keep voice at 100% or less on speaker."
+              : "Tap Join Voice to talk with friends."}
           </p>
         </div>
       )}
