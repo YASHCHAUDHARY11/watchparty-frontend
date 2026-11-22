@@ -3,6 +3,7 @@ import { Play, Pause, Maximize, Minimize, Languages, Loader2, Crown, FolderOpen 
 import SubtitleDrawer from "./SubtitleDrawer.jsx";
 import VoiceAndChat from "./VoiceAndChat.jsx";
 import YouTubePlayer from "./YouTubePlayer.jsx";
+import LanguageBuilder from "./LanguageBuilder.jsx";
 
 const ytId = (raw) => {
   const m = raw
@@ -26,6 +27,11 @@ const toStreamUrl = (raw) => {
   return url.replace(/^http:\/\//, "https://");
 };
 
+const convert = (raw) => {
+  const id = ytId(raw);
+  return id ? `yt:${id}` : toStreamUrl(raw);
+};
+
 const fmt = (s) => {
   if (!Number.isFinite(s)) return "0:00";
   const h = Math.floor(s / 3600);
@@ -47,6 +53,7 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
   const bufTimer = useRef(null);
   const blobRef = useRef(null);
   const pendingSeek = useRef(null);
+  const resumeRef = useRef(false);
 
   const [src, setSrc] = useState("");
   const [urlInput, setUrlInput] = useState("");
@@ -57,8 +64,11 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
   const [buffering, setBuffering] = useState(null);
   const [tracks, setTracks] = useState([]);
   const [showAudio, setShowAudio] = useState(false);
+  const [versions, setVersions] = useState({});
+  const [lang, setLang] = useState("");
 
   const isYt = src.startsWith("yt:");
+  const hasVersions = Object.keys(versions).length > 0;
 
   const remote = (fn) => {
     isRemoteSync.current = true;
@@ -85,6 +95,21 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
   };
 
   const applySource = (source) => {
+    if (source && source.startsWith("multi:")) {
+      try {
+        const map = JSON.parse(source.slice(6));
+        const first = Object.keys(map)[0];
+        if (first) {
+          setVersions(map);
+          setLang(first);
+          setNote("");
+          setSrc(map[first]);
+          return;
+        }
+      } catch {}
+    }
+    setVersions({});
+    setLang("");
     if (source && source.startsWith("local:")) {
       setSrc("");
       setNote(`Host loaded "${source.slice(6)}". Pick the same file below to watch in sync.`);
@@ -224,6 +249,10 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
       v.currentTime = pendingSeek.current;
       pendingSeek.current = null;
     }
+    if (resumeRef.current) {
+      resumeRef.current = false;
+      v.play().catch(() => {});
+    }
     const at = v.audioTracks;
     if (at && at.length) {
       setTracks(
@@ -244,11 +273,36 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
     setTracks((prev) => prev.map((t) => ({ ...t, on: t.i === idx })));
   };
 
+  const pickLang = (l) => {
+    if (l === lang) return setShowAudio(false);
+    const v = videoRef.current;
+    pendingSeek.current = v ? v.currentTime : 0;
+    resumeRef.current = !!(v && !v.paused);
+    isRemoteSync.current = true;
+    clearTimeout(syncTimer.current);
+    syncTimer.current = setTimeout(() => (isRemoteSync.current = false), 4000);
+    setLang(l);
+    setSrc(versions[l]);
+    setShowAudio(false);
+  };
+
+  const shareVersions = (map) => {
+    const first = Object.keys(map)[0];
+    if (!first) return;
+    setVersions(map);
+    setLang(first);
+    setNote("");
+    setSrc(map[first]);
+    emit("change_source", { time: 0, source: `multi:${JSON.stringify(map)}` });
+  };
+
   const onFile = (e) => {
     const f = e.target.files && e.target.files[0];
     if (!f) return;
     if (blobRef.current) URL.revokeObjectURL(blobRef.current);
     blobRef.current = URL.createObjectURL(f);
+    setVersions({});
+    setLang("");
     setSrc(blobRef.current);
     setNote("");
     if (isHost) emit("change_source", { time: 0, source: `local:${f.name}` });
@@ -256,9 +310,10 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
 
   const loadUrl = () => {
     if (!urlInput.trim()) return;
-    const id = ytId(urlInput);
-    const url = id ? `yt:${id}` : toStreamUrl(urlInput);
-    setNote(id ? "" : "Loading video...");
+    const url = convert(urlInput);
+    setVersions({});
+    setLang("");
+    setNote(url.startsWith("yt:") ? "" : "Loading video...");
     setSrc(url);
     emit("change_source", { time: 0, source: url });
   };
@@ -333,32 +388,51 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
           <span className="flex items-center gap-1 text-xs text-zinc-200">
             {isHost && <Crown size={14} className="text-amber-400" />}
             {isHost ? "You are the host" : "Synced to host"}
+            {lang && ` · ${lang}`}
           </span>
-          {!isYt && (
+          {(!isYt || hasVersions) && (
             <button onClick={() => setShowAudio((s) => !s)} className="rounded-full bg-white/15 p-2 text-white">
               <Languages size={18} />
             </button>
           )}
         </div>
 
-        {showAudio && !isYt && (
-          <div className="absolute right-2 top-14 z-30 w-60 rounded-lg bg-black/90 p-3 text-xs text-zinc-200">
-            <p className="mb-2 font-semibold">Audio track (this device only)</p>
-            {tracks.length > 1 ? (
-              tracks.map((t) => (
-                <button
-                  key={t.i}
-                  onClick={() => pickTrack(t.i)}
-                  className={`mb-1 block w-full rounded px-2 py-2 text-left ${t.on ? "bg-indigo-600" : "bg-zinc-800"}`}
-                >
-                  {t.label}
-                </button>
-              ))
-            ) : (
-              <p className="text-zinc-400">
-                No extra audio tracks detected. Mobile Chrome and Safari often block multi-audio
-                MKV files. Try an MP4 with several tracks, or desktop Chrome, Edge or Safari.
-              </p>
+        {showAudio && (
+          <div className="absolute right-2 top-14 z-30 max-h-[70%] w-60 overflow-y-auto rounded-lg bg-black/90 p-3 text-xs text-zinc-200">
+            {hasVersions && (
+              <>
+                <p className="mb-2 font-semibold">Movie language (this device only)</p>
+                {Object.keys(versions).map((l) => (
+                  <button
+                    key={l}
+                    onClick={() => pickLang(l)}
+                    className={`mb-1 block w-full rounded px-2 py-2 text-left ${l === lang ? "bg-indigo-600" : "bg-zinc-800"}`}
+                  >
+                    {l}
+                  </button>
+                ))}
+              </>
+            )}
+            {!isYt && (
+              <>
+                <p className="mb-2 mt-2 font-semibold">Embedded audio track</p>
+                {tracks.length > 1 ? (
+                  tracks.map((t) => (
+                    <button
+                      key={t.i}
+                      onClick={() => pickTrack(t.i)}
+                      className={`mb-1 block w-full rounded px-2 py-2 text-left ${t.on ? "bg-indigo-600" : "bg-zinc-800"}`}
+                    >
+                      {t.label}
+                    </button>
+                  ))
+                ) : (
+                  <p className="text-zinc-400">
+                    No extra audio tracks in this file. Mobile Chrome and Safari often block
+                    multi-audio files.
+                  </p>
+                )}
+              </>
             )}
           </div>
         )}
@@ -400,17 +474,20 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
           <input type="file" accept="video/*,.mkv" onChange={onFile} className="hidden" />
         </label>
         {isHost ? (
-          <div className="flex gap-2">
-            <input
-              value={urlInput}
-              onChange={(e) => setUrlInput(e.target.value)}
-              placeholder="YouTube, Dropbox, Drive or direct .mp4 link"
-              className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-3 text-base text-zinc-50 outline-none focus:border-indigo-500"
-            />
-            <button onClick={loadUrl} className="rounded-lg bg-indigo-600 px-4 font-semibold active:bg-indigo-700">
-              Load
-            </button>
-          </div>
+          <>
+            <div className="flex gap-2">
+              <input
+                value={urlInput}
+                onChange={(e) => setUrlInput(e.target.value)}
+                placeholder="YouTube, Dropbox, Drive or direct .mp4 link"
+                className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-3 text-base text-zinc-50 outline-none focus:border-indigo-500"
+              />
+              <button onClick={loadUrl} className="rounded-lg bg-indigo-600 px-4 font-semibold active:bg-indigo-700">
+                Load
+              </button>
+            </div>
+            <LanguageBuilder onShare={shareVersions} convert={convert} />
+          </>
         ) : (
           <p className="text-zinc-500">Only the host can load a stream URL.</p>
         )}
