@@ -2,13 +2,28 @@ import { useEffect, useRef, useState } from "react";
 import { Play, Pause, Maximize, Minimize, Languages, Loader2, Crown, FolderOpen } from "lucide-react";
 import SubtitleDrawer from "./SubtitleDrawer.jsx";
 import VoiceAndChat from "./VoiceAndChat.jsx";
+import YouTubePlayer from "./YouTubePlayer.jsx";
+
+const ytId = (raw) => {
+  const m = raw
+    .trim()
+    .match(/(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/|live\/)|youtu\.be\/)([\w-]{11})/);
+  return m ? m[1] : null;
+};
 
 const toStreamUrl = (raw) => {
-  const url = raw.trim();
-  const m =
+  let url = raw.trim();
+  const drive =
     url.match(/drive\.google\.com\/file\/d\/([\w-]+)/) ||
     url.match(/drive\.google\.com\/.*[?&]id=([\w-]+)/);
-  return m ? `https://drive.google.com/uc?export=download&id=${m[1]}` : url;
+  if (drive) {
+    return `https://drive.usercontent.google.com/download?id=${drive[1]}&export=download&confirm=t`;
+  }
+  if (/dropbox\.com/.test(url)) {
+    url = url.replace(/[?&]dl=0/, "").replace(/[?&]raw=1/, "");
+    return url + (url.includes("?") ? "&" : "?") + "raw=1";
+  }
+  return url.replace(/^http:\/\//, "https://");
 };
 
 const fmt = (s) => {
@@ -42,6 +57,8 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
   const [buffering, setBuffering] = useState(null);
   const [tracks, setTracks] = useState([]);
   const [showAudio, setShowAudio] = useState(false);
+
+  const isYt = src.startsWith("yt:");
 
   const remote = (fn) => {
     isRemoteSync.current = true;
@@ -202,6 +219,7 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
 
   const onMeta = () => {
     const v = videoRef.current;
+    if (!v) return;
     if (pendingSeek.current) {
       v.currentTime = pendingSeek.current;
       pendingSeek.current = null;
@@ -238,15 +256,24 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
 
   const loadUrl = () => {
     if (!urlInput.trim()) return;
-    const url = toStreamUrl(urlInput);
+    const id = ytId(urlInput);
+    const url = id ? `yt:${id}` : toStreamUrl(urlInput);
+    setNote(id ? "" : "Loading video...");
     setSrc(url);
-    setNote("");
     emit("change_source", { time: 0, source: url });
   };
 
   const togglePlay = () => {
     const v = videoRef.current;
     if (v && src) (v.paused ? v.play().catch(() => {}) : v.pause());
+  };
+
+  const handlers = {
+    onPlay: () => { setPlaying(true); poke(); emit("play"); },
+    onPause: () => { setPlaying(false); setShow(true); clearTimeout(hideTimer.current); emit("pause"); },
+    onSeeked: () => emit("seek"),
+    onWaiting: () => { setBuffering("Buffering..."); emit("buffering"); },
+    onPlaying: () => setBuffering(null),
   };
 
   const bar = `absolute inset-x-0 z-20 flex items-center gap-2 px-3 py-2 transition-opacity duration-300 ${
@@ -262,20 +289,32 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
           isFs ? "fixed inset-0 z-50 h-[100dvh] w-screen" : "relative aspect-video w-full"
         }`}
       >
-        <video
-          ref={videoRef}
-          src={src || undefined}
-          playsInline
-          className="h-full w-full bg-black object-contain"
-          onClick={() => (show ? setShow(false) : poke())}
-          onLoadedMetadata={onMeta}
-          onPlay={() => { setPlaying(true); poke(); emit("play"); }}
-          onPause={() => { setPlaying(false); setShow(true); clearTimeout(hideTimer.current); emit("pause"); }}
-          onSeeked={() => emit("seek")}
-          onWaiting={() => { setBuffering("Buffering..."); emit("buffering"); }}
-          onPlaying={() => setBuffering(null)}
-          onCanPlay={() => setBuffering(null)}
-        />
+        {isYt ? (
+          <YouTubePlayer
+            videoId={src.slice(3)}
+            videoRef={videoRef}
+            onTap={() => (show ? setShow(false) : poke())}
+            onMeta={onMeta}
+            onError={() => setNote("This YouTube video can't be embedded. Try a different video.")}
+            {...handlers}
+          />
+        ) : (
+          <video
+            ref={videoRef}
+            src={src || undefined}
+            playsInline
+            className="h-full w-full bg-black object-contain"
+            onClick={() => (show ? setShow(false) : poke())}
+            onLoadedMetadata={onMeta}
+            onCanPlay={() => { setBuffering(null); setNote(""); }}
+            onError={() => {
+              if (!src) return;
+              setBuffering(null);
+              setNote("This link can't be played. Check that it is public, is a direct .mp4/.webm link, and is not an MKV file. Large Google Drive files often fail; try Dropbox or a local file instead.");
+            }}
+            {...handlers}
+          />
+        )}
 
         {!src && (
           <p className="pointer-events-none absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-zinc-400">
@@ -295,12 +334,14 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
             {isHost && <Crown size={14} className="text-amber-400" />}
             {isHost ? "You are the host" : "Synced to host"}
           </span>
-          <button onClick={() => setShowAudio((s) => !s)} className="rounded-full bg-white/15 p-2 text-white">
-            <Languages size={18} />
-          </button>
+          {!isYt && (
+            <button onClick={() => setShowAudio((s) => !s)} className="rounded-full bg-white/15 p-2 text-white">
+              <Languages size={18} />
+            </button>
+          )}
         </div>
 
-        {showAudio && (
+        {showAudio && !isYt && (
           <div className="absolute right-2 top-14 z-30 w-60 rounded-lg bg-black/90 p-3 text-xs text-zinc-200">
             <p className="mb-2 font-semibold">Audio track (this device only)</p>
             {tracks.length > 1 ? (
@@ -347,7 +388,7 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
           </button>
         </div>
 
-        <SubtitleDrawer videoRef={videoRef} />
+        {!isYt && <SubtitleDrawer videoRef={videoRef} />}
         <VoiceAndChat socket={socket} roomData={roomData} videoRef={videoRef} />
       </div>
 
@@ -363,7 +404,7 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
             <input
               value={urlInput}
               onChange={(e) => setUrlInput(e.target.value)}
-              placeholder="Direct .mp4/.webm or Google Drive link"
+              placeholder="YouTube, Dropbox, Drive or direct .mp4 link"
               className="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-3 text-base text-zinc-50 outline-none focus:border-indigo-500"
             />
             <button onClick={loadUrl} className="rounded-lg bg-indigo-600 px-4 font-semibold active:bg-indigo-700">
