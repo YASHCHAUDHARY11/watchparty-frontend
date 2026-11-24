@@ -48,12 +48,15 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
   const timeRef = useRef(null);
   const dragging = useRef(false);
   const isRemoteSync = useRef(false);
+  const seekGuard = useRef(false);
+  const guardTimer = useRef(null);
   const syncTimer = useRef(null);
   const hideTimer = useRef(null);
   const bufTimer = useRef(null);
   const blobRef = useRef(null);
   const pendingSeek = useRef(null);
   const resumeRef = useRef(false);
+  const hostLive = useRef({ time: 0, playing: false, at: 0 });
 
   const [src, setSrc] = useState("");
   const [urlInput, setUrlInput] = useState("");
@@ -66,6 +69,7 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
   const [showAudio, setShowAudio] = useState(false);
   const [versions, setVersions] = useState({});
   const [lang, setLang] = useState("");
+  const [needTap, setNeedTap] = useState(false);
 
   const isYt = src.startsWith("yt:");
   const hasVersions = Object.keys(versions).length > 0;
@@ -75,6 +79,20 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
     fn();
     clearTimeout(syncTimer.current);
     syncTimer.current = setTimeout(() => (isRemoteSync.current = false), 500);
+  };
+
+  // Seek caused by sync (not by the user): its "seeked" event must not be echoed
+  const setTime = (v, t) => {
+    seekGuard.current = true;
+    clearTimeout(guardTimer.current);
+    guardTimer.current = setTimeout(() => (seekGuard.current = false), 5000);
+    v.currentTime = t;
+  };
+
+  // Browsers may refuse play() without a tap; show the tap overlay instead of failing silently
+  const tryPlay = (v) => {
+    const r = v.play();
+    if (r && r.catch) r.catch(() => setNeedTap(true));
   };
 
   const emit = (action, extra = {}) => {
@@ -139,24 +157,36 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
         bufTimer.current = setTimeout(() => setBuffering(null), 5000);
         return;
       }
+      if (typeof p.time === "number") {
+        const was = hostLive.current.playing;
+        hostLive.current = {
+          time: p.time,
+          playing: p.action === "play" ? true : p.action === "pause" ? false : was,
+          at: Date.now(),
+        };
+      }
       if (!v) return;
       remote(() => {
         if (typeof p.time === "number" && Math.abs(v.currentTime - p.time) > 0.3) {
-          v.currentTime = p.time;
+          setTime(v, p.time);
         }
-        if (p.action === "play") v.play().catch(() => {});
-        if (p.action === "pause") v.pause();
+        if (p.action === "play") tryPlay(v);
+        if (p.action === "pause") {
+          v.pause();
+          v.playbackRate = 1;
+        }
       });
       if (p.action === "play") setBuffering(null);
     };
     const onBeat = (p) => {
+      hostLive.current = { time: p.time, playing: true, at: Date.now() };
       const v = videoRef.current;
       if (isHost || !v || !v.duration) return;
-      if (v.paused) remote(() => v.play().catch(() => {}));
+      if (v.paused) remote(() => tryPlay(v));
       const drift = p.time - v.currentTime;
       const abs = Math.abs(drift);
       if (abs > 2.5) {
-        remote(() => (v.currentTime = p.time));
+        remote(() => setTime(v, p.time));
         v.playbackRate = 1;
       } else if (abs > 0.5) {
         v.playbackRate = drift > 0 ? 1.05 : 0.95;
@@ -246,12 +276,12 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
     const v = videoRef.current;
     if (!v) return;
     if (pendingSeek.current) {
-      v.currentTime = pendingSeek.current;
+      setTime(v, pendingSeek.current);
       pendingSeek.current = null;
     }
     if (resumeRef.current) {
       resumeRef.current = false;
-      v.play().catch(() => {});
+      tryPlay(v);
     }
     const at = v.audioTracks;
     if (at && at.length) {
@@ -320,15 +350,34 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
 
   const togglePlay = () => {
     const v = videoRef.current;
-    if (v && src) (v.paused ? v.play().catch(() => {}) : v.pause());
+    if (v && src) (v.paused ? tryPlay(v) : v.pause());
+  };
+
+  // Called from a real tap, so the browser allows playback
+  const joinPlayback = () => {
+    const v = videoRef.current;
+    setNeedTap(false);
+    if (!v) return;
+    const h = hostLive.current;
+    const target = h.playing ? h.time + (Date.now() - h.at) / 1000 : h.time;
+    remote(() => {
+      if (Math.abs(v.currentTime - target) > 0.5) setTime(v, target);
+      if (h.playing) tryPlay(v);
+    });
   };
 
   const handlers = {
     onPlay: () => { setPlaying(true); poke(); emit("play"); },
     onPause: () => { setPlaying(false); setShow(true); clearTimeout(hideTimer.current); emit("pause"); },
-    onSeeked: () => emit("seek"),
+    onSeeked: () => {
+      if (seekGuard.current) {
+        seekGuard.current = false;
+        return;
+      }
+      emit("seek");
+    },
     onWaiting: () => { setBuffering("Buffering..."); emit("buffering"); },
-    onPlaying: () => setBuffering(null),
+    onPlaying: () => { setBuffering(null); setNeedTap(false); },
   };
 
   const bar = `absolute inset-x-0 z-20 flex items-center gap-2 px-3 py-2 transition-opacity duration-300 ${
@@ -375,6 +424,15 @@ export default function WatchRoom({ socket, roomData, currentUser }) {
           <p className="pointer-events-none absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-zinc-400">
             {isHost ? "Load a movie below to start" : "Waiting for the host to load a movie..."}
           </p>
+        )}
+
+        {needTap && src && (
+          <button
+            onClick={joinPlayback}
+            className="absolute inset-0 z-[25] flex items-center justify-center bg-black/60 px-6 text-center text-base font-semibold text-white"
+          >
+            Tap to join playback
+          </button>
         )}
 
         {buffering && (
